@@ -1,0 +1,16 @@
+
+ldData :=
+    head
+    channels
+    vehicle
+    venue
+    event
+
+
+call tree:
+
+ldData
+>ldHead.__init__
+>if ldEvent.fromfile()
+>if ldVenue.fromfile()
+>if ldVehicle.fromfile()
