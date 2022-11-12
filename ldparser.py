@@ -11,24 +11,40 @@ from pathlib import Path
 import numpy as np
 
 
-class ldData(object):
-    """Container for parsed data of ld file.
-    Allows reading and writing. """
+class ldData:
+    """Container for parsed data of ld file. Allows reading and writing. """
 
     def __init__(self, data_file: Path) -> None:
         self.data_file = data_file
         with open(self.data_file, mode='rb') as fd:
             with mmap.mmap(fd.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                ###TODO extract all the pointer structures, make a 'index table' out of them
+                ###then make memoryviews out of each section, for clear fmt.unpack(mysection)
+
+                ### ldHead
                 self.head = ldHead(mm[0:ldHead.fmt_struct.size])
-                self.channs = []
+                ### ldEvent
+                if self.head.aux_ptr > 0:
+                    # self.head.aux_ptr is the venue offset
+                    event_start = self.head.aux_ptr
+                    event_end = event_start + ldEvent.fmt_struct.size
+                    self.aux = ldEvent(mm[event_start:event_end])
+                ### ldVenue
+                if self.aux.venue_ptr > 0:
+                    venue_start = self.aux.venue_ptr
+                    venue_end = venue_start + ldVenue.fmt_struct.size
+                    self.venue = ldVenue(mm[venue_start:venue_end])
+                ### ldVehicle
+                if self.venue.vehicle_ptr > 0:
+                    vehicle_start = self.venue.vehicle_ptr
+                    vehicle_end = vehicle_start + ldVehicle.fmt_struct.size
+                    self.vehicle = ldVehicle(mm[vehicle_start:vehicle_end])
+                ### ldChan
+                self.channs = []  ###TODO dataclasses?
                 ### TODO bring the rest of the sections here.
                 ### pass in only the areas of mm that are needed
                 ### probably keep track of offsets for sections
                 ### keep converting the fromfile to proper constructors
-                ### ldEvent
-                ### ldVenue
-                ### ldVehicle
-                ### ldChan
 
     def read_channels(self, meta_ptr: int) -> list:
         """ Read channel data inside ld file
@@ -57,6 +73,7 @@ class ldData(object):
 
     @classmethod
     def frompd(cls, df):
+        raise NotImplementedError
         # type: (pd.DataFrame) -> ldData
         """Create and ldData object from a pandas DataFrame.
 
@@ -128,6 +145,7 @@ class ldData(object):
         return cls(head, channs)
 
     def write(self, f: str) -> None:
+        raise NotImplementedError
         """Write ld file containing the current header information and channel data """
 
         # convert the data using scale/shift etc before writing the data
@@ -140,29 +158,17 @@ class ldData(object):
             list(map(lambda c: f_.write(conv_data(c).astype(c.dtype)), self.channs))
 
 
-class ldEvent(object):
+class ldEvent:
     fmt = '<64s64s1024sH'
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, name, session, comment, venue_ptr, venue):
-        self.name, self.session, self.comment, self.venue_ptr, self.venue = \
-            name, session, comment, venue_ptr, venue
-
-    @classmethod
-    def fromfile(cls, f: Path) -> ldEvent:  ###TODO this needs to integrate into __init__ so it makes sense
-        """Parses and stores the event information in an ld file """
-        name, session, comment, venue_ptr = struct.unpack(ldEvent.fmt, f.read(struct.calcsize(ldEvent.fmt)))
-        name, session, comment = map(decode_string, [name, session, comment])
-
-        venue = None
-        if venue_ptr > 0:
-            f.seek(venue_ptr)
-            venue = ldVenue.fromfile(f)
-
-        return cls(name, session, comment, venue_ptr, venue)
+    def __init__(self, section_file_map):
+        name, session, comment, self.venue_ptr = ldEvent.fmt_struct.unpack(section_file_map)
+        self.name, self.session, self.comment = map(normalize_text, [name, session, comment])
 
     def write(self, f):
+        raise NotImplementedError
         f.write(struct.pack(ldEvent.fmt,
                             self.name.encode(),
                             self.session.encode(),
@@ -174,29 +180,21 @@ class ldEvent(object):
             self.venue.write(f)
 
     def __str__(self):
-        return "%s; venue: %s" % (self.name, self.venue)
+        return f"Event: {vars(self)}"
 
 
-class ldVenue(object):
+class ldVenue:
     fmt = '<64s1034xH'
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, name, vehicle_ptr, vehicle):
-        self.name, self.vehicle_ptr, self.vehicle = name, vehicle_ptr, vehicle
-
-    @classmethod
-    def fromfile(cls, f: Path) -> ldVenue:
-        """Parses and stores the venue information in an ld file """
-        name, vehicle_ptr = struct.unpack(ldVenue.fmt, f.read(struct.calcsize(ldVenue.fmt)))
-
-        vehicle = None
-        if vehicle_ptr > 0:
-            f.seek(vehicle_ptr)
-            vehicle = ldVehicle.fromfile(f)
-        return cls(decode_string(name), vehicle_ptr, vehicle)
+    def __init__(self, section_file_map):
+        """Parses and stores the venue information in ld file """
+        name, self.vehicle_ptr = ldVenue.fmt_struct.unpack(section_file_map)
+        self.name = normalize_text(name)
 
     def write(self, f):
+        raise NotImplementedError
         f.write(struct.pack(ldVenue.fmt, self.name.encode(), self.vehicle_ptr))
 
         if self.vehicle_ptr > 0:
@@ -204,32 +202,29 @@ class ldVenue(object):
             self.vehicle.write(f)
 
     def __str__(self):
-        return "%s; vehicle: %s" % (self.name, self.vehicle)
+        return f"Venue: {vars(self)}"
 
 
-class ldVehicle(object):
+class ldVehicle:
     fmt = '<64s128xI32s32s'
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, id, weight, type, comment):
-        self.id, self.weight, self.type, self.comment = id, weight, type, comment
-
-    @classmethod
-    def fromfile(cls, f: Path) -> ldVehicle:
+    def __init__(self, section_file_map):
         """Parses and stores the vehicle information in an ld file """
-        id, weight, type, comment = struct.unpack(ldVehicle.fmt, f.read(struct.calcsize(ldVehicle.fmt)))
-        id, type, comment = map(decode_string, [id, type, comment])
-        return cls(id, weight, type, comment)
+        # self.id, self.weight, self.type, self.comment = id, weight, type, comment
+        vehicle_id, self.weight, vehicle_type, comment = ldVehicle.fmt_struct.unpack(section_file_map)
+        self.id, self.type, self.comment = map(normalize_text, [vehicle_id, vehicle_type, comment])
 
     def write(self, f):
+        raise NotImplementedError
         f.write(struct.pack(ldVehicle.fmt, self.id.encode(), self.weight, self.type.encode(), self.comment.encode()))
 
     def __str__(self):
-        return "%s (type: %s, weight: %i, %s)" % (self.id, self.type, self.weight, self.comment)
+        return f"Venue: {vars(self)}"
 
 
-class ldHead(object):
+class ldHead:
     fmt = '<' + (
         "I4x"  # ldmarker
         "II"  # chann_meta_ptr chann_data_ptr
@@ -263,18 +258,16 @@ class ldHead(object):
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, data_file_map) -> None:
+    def __init__(self, section_file_map) -> None:
         """Parses and stores the header information of ld file """
         (_, meta_ptr, data_ptr, aux_ptr,
          _, _, _, _, _, _, _,
          n, date, time,
-         driver, vehicleid, venue, _, short_comment, event, session) = ldHead.fmt_struct.unpack(data_file_map)
+         driver, vehicle_id, venue, _, short_comment, event, session) = ldHead.fmt_struct.unpack(section_file_map)
 
-        # date, time, driver, vehicleid, venue, short_comment, event, session = \
-        #     map(decode_string, [date, time, driver, vehicleid, venue, short_comment, event, session])
-        most_entries = (date, time, driver, vehicleid, venue, short_comment, event, session)
-        date, time, driver, vehicleid, venue, short_comment, event, session = [decode_string(entry) for entry in
-                                                                               most_entries]
+        most_entries = (date, time, driver, vehicle_id, venue, short_comment, event, session)
+        date, time, driver, vehicle_id, venue, short_comment, event, session = [normalize_text(entry) for entry in
+                                                                                most_entries]
 
         try:
             # first, try to decode datatime with seconds
@@ -282,15 +275,12 @@ class ldHead(object):
         except ValueError:
             _datetime = datetime.datetime.strptime('%s %s' % (date, time), '%d/%m/%Y %H:%M')
 
-        aux = None
-        # if aux_ptr > 0:
-        #     f.seek(aux_ptr)
-        #     aux = ldEvent.fromfile(f)
         ### populate it with dict(zip(a,b)) ?
-        self.meta_ptr, self.data_ptr, self.aux_ptr, self.aux, self.driver, self.vehicleid, self.venue, self.datetime, self.short_comment, self.event, self.session = \
-            meta_ptr, data_ptr, aux_ptr, aux, driver, vehicleid, venue, datetime, short_comment, event, session
+        self.meta_ptr, self.data_ptr, self.aux_ptr, self.driver, self.vehicle_id, self.venue, self.datetime, self.short_comment, self.event, self.session = \
+            meta_ptr, data_ptr, aux_ptr, driver, vehicle_id, venue, _datetime, short_comment, event, session
 
     def write(self, f, n):
+        raise NotImplementedError
         f.write(struct.pack(ldHead.fmt,
                             0x40,
                             self.meta_ptr, self.data_ptr, self.aux_ptr,
@@ -306,18 +296,10 @@ class ldHead(object):
             self.aux.write(f)
 
     def __str__(self):
-        ### TODO change to f-strings
-        return 'driver:    %s\n' \
-               'vehicleid: %s\n' \
-               'venue:     %s\n' \
-               'event:     %s\n' \
-               'session:   %s\n' \
-               'short_comment: %s\n' \
-               'event_long:    %s' % (
-                   self.driver, self.vehicleid, self.venue, self.event, self.session, self.short_comment, self.aux)
+        return f"Header: {vars(self)}"
 
 
-class ldChan(object):
+class ldChan:
     """Channel (meta) data
 
     Parses and stores the channel metadata in a ld file.
@@ -365,7 +347,7 @@ class ldChan(object):
              dtype_a, dtype, freq, shift, mul, scale, dec,
              name, short_name, unit) = struct.unpack(ldChan.fmt, f.read(struct.calcsize(ldChan.fmt)))
 
-        name, short_name, unit = map(decode_string, [name, short_name, unit])
+        name, short_name, unit = map(normalize_text, [name, short_name, unit])
 
         if dtype_a in [0x07]:
             dtype = [None, np.float16, None, np.float32][dtype - 1]
@@ -378,6 +360,7 @@ class ldChan(object):
                    name, short_name, unit)
 
     def write(self, f, n):
+        raise NotImplementedError
         if self.dtype == np.float16 or self.dtype == np.float32:
             dtype_a = 0x07
             dtype = {np.float16: 2, np.float32: 4}[self.dtype]
@@ -391,8 +374,7 @@ class ldChan(object):
                             self.name.encode(), self.short_name.encode(), self.unit.encode()))
 
     @property
-    def data(self):
-        # type: () -> np.array
+    def data(self) -> np.array:
         """ Read the data words of the channel """
         if self._data is None:
             # jump to data and read
@@ -420,13 +402,13 @@ class ldChan(object):
             self.freq)
 
 
-def decode_string(bytes) -> str:
+def normalize_text(inputs: bytes) -> str:
     """decode the bytes and remove trailing zeros """
     try:
         ###TODO do we want to remove everything that's not ASCII printable?
-        return bytes.decode('ascii').strip().rstrip('\0').strip()
+        return inputs.decode('ascii').strip().rstrip('\0').strip()
     except Exception as e:
-        print("Could not decode string: %s - %s" % (e, bytes))
+        print("Could not decode string: %s - %s" % (e, inputs))
         return ""
         # raise e
 
@@ -439,7 +421,6 @@ if __name__ == '__main__':
     """
 
     import sys
-    from pathlib import Path
     from itertools import groupby
     import pandas as pd
     import matplotlib.pyplot as plt
@@ -450,12 +431,15 @@ if __name__ == '__main__':
 
     data_files = Path.cwd().glob('*.ld')
     for data_file in data_files:
-        print("Processing file:")
-        print(data_file.name)
+        print(f" [*] Processing file: {data_file}")
         l = ldData(data_file)
-        print(l.head)
-        print([str(s) for s in l])
-        print()
+        ###checking __str__
+        print(f" [*] {l.head}")
+        print(f" [*] {l.aux}")
+        print(f" [*] {l.vehicle}")
+        print(f" [*] {l.venue}")
+        print(f" [*] {l.channs}")  ### TODO not done, just a control value for empties
+
         sys.exit(1)
 
         ###TODO make into a test case?  debug aid?

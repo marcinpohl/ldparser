@@ -11,6 +11,8 @@ call tree:
 
 ldData
 >ldHead.__init__
->if ldEvent.fromfile()
->if ldVenue.fromfile()
->if ldVehicle.fromfile()
+>ldEvent.__init__
+>ldVenue.__init__
+>ldVehicle.__init__
+
+### siblings, not child-of-child
