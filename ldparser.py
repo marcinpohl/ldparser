@@ -2,11 +2,12 @@
 
 Code created through reverse engineering the data format.
 """
-
+from dataclasses import dataclass
 import datetime
 import struct
 import mmap
 from pathlib import Path
+import pandas as pd
 
 import numpy as np
 
@@ -40,25 +41,14 @@ class ldData:
                     vehicle_end = vehicle_start + ldVehicle.fmt_struct.size
                     self.vehicle = ldVehicle(mm[vehicle_start:vehicle_end])
                 ### ldChan
-                self.channs = []  ###TODO dataclasses?
+                ###TODO dataclasses?
+                channs_start = self.head.meta_ptr
+                channs_end = channs_start + ldChan.fmt_struct.size
+                self.channs = ldChan(mm[channs_start:channs_end])
                 ### TODO bring the rest of the sections here.
                 ### pass in only the areas of mm that are needed
                 ### probably keep track of offsets for sections
                 ### keep converting the fromfile to proper constructors
-
-    def read_channels(self, meta_ptr: int) -> list:
-        """ Read channel data inside ld file
-
-        Cycles through the channels inside ld file,
-         starting with the one where meta_ptr points to.
-         Returns a list of ldchan objects.
-        """
-        chans = []
-        while meta_ptr:
-            chan_ = ldChan.fromfile(self.data_file, meta_ptr)
-            chans.append(chan_)
-            meta_ptr = chan_.next_meta_ptr
-        return chans
 
     def __getitem__(self, item):
         if not isinstance(item, int):
@@ -71,10 +61,11 @@ class ldData:
     def __iter__(self):
         return iter(x.name for x in self.channs)
 
+    # noinspection PyArgumentList,PyUnusedLocal
     @classmethod
-    def frompd(cls, df):
+    def frompd(cls, df: pd.DataFrame):
         raise NotImplementedError
-        # type: (pd.DataFrame) -> ldData
+        ### -> ldData  so it doesnt flake out
         """Create and ldData object from a pandas DataFrame.
 
         Example:
@@ -144,10 +135,9 @@ class ldData:
             channs.append(chan)
         return cls(head, channs)
 
-    def write(self, f: str) -> None:
-        raise NotImplementedError
+    def write(self, f: str) -> None:  # noqa
         """Write ld file containing the current header information and channel data """
-
+        raise NotImplementedError
         # convert the data using scale/shift etc before writing the data
         conv_data = lambda c: ((c.data / c.mul) - c.shift) * c.scale / pow(10., -c.dec)
 
@@ -221,7 +211,7 @@ class ldVehicle:
         f.write(struct.pack(ldVehicle.fmt, self.id.encode(), self.weight, self.type.encode(), self.comment.encode()))
 
     def __str__(self):
-        return f"Venue: {vars(self)}"
+        return f"Vehicle: {vars(self)}"
 
 
 class ldHead:
@@ -320,86 +310,68 @@ class ldChan:
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, _f, meta_ptr, prev_meta_ptr, next_meta_ptr, data_ptr, data_len,
-                 dtype, freq, shift, mul, scale, dec,
-                 name, short_name, unit):
+    def __init__(self, meta_ptr: int) -> None:
+        """ Read channel data inside ld file
 
-        self._f = _f
-        self.meta_ptr = meta_ptr
-        self._data = None
+        Cycles through the channels inside ld file,
+         starting with the one where meta_ptr points to.
+         Returns a list of ldchan objects.
+        """
+        ### MAP OUT CHANNELS
+        self.meta = {}
+        unpacked_channel_meta = ldChan.fmt_struct.unpack(meta_ptr)  ### unpack into a tuple so we can pull out a name for indexing
+        channel_name = normalize_text(unpacked_channel_meta[-3])
+        self.meta[channel_name] = ChanMeta(*unpacked_channel_meta) ### making a dataclass from the unpacked data
 
-        (self.prev_meta_ptr, self.next_meta_ptr, self.data_ptr, self.data_len,
-         self.dtype, self.freq,
-         self.shift, self.mul, self.scale, self.dec,
-         self.name, self.short_name, self.unit) = prev_meta_ptr, next_meta_ptr, data_ptr, data_len, \
-                                                  dtype, freq, \
-                                                  shift, mul, scale, dec, \
-                                                  name, short_name, unit
+        # prev_meta_ptr, next_meta_ptr, data_ptr, data_len, _, dtype_a, dtype, freq, shift, mul, scale, dec, name, short_name, unit = unpacked_fields
+        # name, short_name, unit = map(normalize_text, (name, short_name, unit))
+        # channel_values = \
+        #     (prev_meta_ptr, next_meta_ptr, data_ptr, data_len, _,
+        #      dtype_a, dtype, freq, shift, mul, scale, dec,
+        #      short_name, unit)
 
-    @classmethod
-    def fromfile(cls, _f, meta_ptr):
-        # type: (str, int) -> ldChan
-        """Parses and stores the header information of ld channel in a ld file """
-        with open(_f, 'rb') as f:
-            f.seek(meta_ptr)
+        # self.channels[name] = channel_values
+        # self.channels[name] = locals()
 
-            (prev_meta_ptr, next_meta_ptr, data_ptr, data_len, _,
-             dtype_a, dtype, freq, shift, mul, scale, dec,
-             name, short_name, unit) = struct.unpack(ldChan.fmt, f.read(struct.calcsize(ldChan.fmt)))
+        ###experiment see if we can see second series
+        # unpacked_fields = ldChan.fmt_struct.unpack(self.next_meta_ptr)
+        # self.prev_meta_ptr, self.next_meta_ptr, self.data_ptr, self.data_len, _, self.dtype_a, self.dtype, self.freq, self.shift, self.mul, self.scale, self.dec, name, short_name, unit = unpacked_fields
+        # self.name, self.short_name, self.unit = map(normalize_text, (name, short_name, unit))
 
-        name, short_name, unit = map(normalize_text, [name, short_name, unit])
-
-        if dtype_a in [0x07]:
-            dtype = [None, np.float16, None, np.float32][dtype - 1]
-        elif dtype_a in [0, 0x03, 0x05]:
-            dtype = [None, np.int16, None, np.int32][dtype - 1]
-        else:
-            raise TypeError('Datatype %i not recognized' % dtype_a)
-
-        return cls(_f, meta_ptr, prev_meta_ptr, next_meta_ptr, data_ptr, data_len, dtype, freq, shift, mul, scale, dec,
-                   name, short_name, unit)
-
-    def write(self, f, n):
-        raise NotImplementedError
-        if self.dtype == np.float16 or self.dtype == np.float32:
-            dtype_a = 0x07
-            dtype = {np.float16: 2, np.float32: 4}[self.dtype]
-        else:
-            dtype_a = 0x05 if self.dtype == np.int32 else 0x03
-            dtype = {np.int16: 2, np.int32: 4}[self.dtype]
-
-        f.write(struct.pack(ldChan.fmt,
-                            self.prev_meta_ptr, self.next_meta_ptr, self.data_ptr, self.data_len,
-                            0x2ee1 + n, dtype_a, dtype, self.freq, self.shift, self.mul, self.scale, self.dec,
-                            self.name.encode(), self.short_name.encode(), self.unit.encode()))
-
-    @property
-    def data(self) -> np.array:
-        """ Read the data words of the channel """
-        if self._data is None:
-            # jump to data and read
-            with open(self._f, 'rb') as f:
-                f.seek(self.data_ptr)
-                try:
-                    self._data = np.fromfile(f, count=self.data_len, dtype=self.dtype)
-                    self._data = (self._data / self.scale * pow(10., -self.dec) + self.shift) * self.mul
-
-                    if len(self._data) != self.data_len:
-                        raise ValueError("Not all data read!")
-
-                except ValueError as v:
-                    print(v, self.name, self.freq,
-                          hex(self.data_ptr), hex(self.data_len),
-                          hex(len(self._data)), hex(f.tell()))
-                    # raise v
-        return self._data
+        ### read in individual data series
+        # chans = []
+        # while meta_ptr:
+        #     chan_ = ldChan.fromfile(self.data_file, meta_ptr)
+        #     chans.append(chan_)
+        #     meta_ptr = chan_.next_meta_ptr
+        # return chans
 
     def __str__(self):
-        ### TODO f-strings
-        return 'chan %s (%s) [%s], %i Hz' % (
-            self.name,
-            self.short_name, self.unit,
-            self.freq)
+        return f"Channels: {vars(self)}"
+
+
+@dataclass(slots=True)
+class ChanMeta:
+    prev_meta_ptr: int
+    next_meta_ptr: int
+    data_ptr: int
+    data_len: int
+    blah: int
+    dtype_a: int
+    dtype: int
+    freq: int
+    shift: int
+    mul: int
+    scale: int
+    dec: int
+    name: str
+    short_name: str
+    unit: str
+
+    def __post_init__(self):
+        self.name = normalize_text(self.name)
+        self.short_name = normalize_text(self.short_name)
+        self.unit = normalize_text(self.unit)
 
 
 def normalize_text(inputs: bytes) -> str:
@@ -438,8 +410,11 @@ if __name__ == '__main__':
         print(f" [*] {l.aux}")
         print(f" [*] {l.vehicle}")
         print(f" [*] {l.venue}")
-        print(f" [*] {l.channs}")  ### TODO not done, just a control value for empties
-
+        # print(f" [*] {l.channs.data_ptr}")
+        # print(f" [*] {l.channs.data_len}")
+        # print(f" [*] {l.channs.name}")
+        # print(f" [*] {l.channs.short_name}")
+        print(f" [*] {l.channs}")
         sys.exit(1)
 
         ###TODO make into a test case?  debug aid?
