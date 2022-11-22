@@ -16,39 +16,55 @@ class ldData:
     """Container for parsed data of ld file. Allows reading and writing. """
 
     def __init__(self, data_file: Path) -> None:
+        self.mem_areas = {}
         self.data_file = data_file
         with open(self.data_file, mode='rb') as fd:
             with mmap.mmap(fd.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 ###TODO extract all the pointer structures, make a 'index table' out of them
-                ###then make memoryviews out of each section, for clear fmt.unpack(mysection)
 
                 ### ldHead
-                self.head = ldHead(mm[0:ldHead.fmt_struct.size])
+                ### mem_areas MUST exist BEFORE/outside section-specific classes.
+                self.mem_areas['head'] = memoryview(mm[0:ldHead.fmt_struct.size])  ### it's a header, so start from 0
+                self.head = ldHead(self.mem_areas['head'])
+
                 ### ldEvent
                 if self.head.aux_ptr > 0:
-                    # self.head.aux_ptr is the venue offset
                     event_start = self.head.aux_ptr
                     event_end = event_start + ldEvent.fmt_struct.size
-                    self.aux = ldEvent(mm[event_start:event_end])
+                    self.mem_areas['event'] = memoryview(mm[event_start:event_end])
+                    self.aux = ldEvent(self.mem_areas['event'])
+
                 ### ldVenue
                 if self.aux.venue_ptr > 0:
                     venue_start = self.aux.venue_ptr
                     venue_end = venue_start + ldVenue.fmt_struct.size
-                    self.venue = ldVenue(mm[venue_start:venue_end])
+                    self.mem_areas['venue'] = memoryview(mm[venue_start:venue_end])
+                    self.venue = ldVenue(self.mem_areas['venue'])
+
                 ### ldVehicle
                 if self.venue.vehicle_ptr > 0:
                     vehicle_start = self.venue.vehicle_ptr
                     vehicle_end = vehicle_start + ldVehicle.fmt_struct.size
-                    self.vehicle = ldVehicle(mm[vehicle_start:vehicle_end])
+                    self.mem_areas['vehicle'] = memoryview(mm[vehicle_start:vehicle_end])
+                    self.vehicle = ldVehicle(self.mem_areas['vehicle'])
+
                 ### ldChan
-                ###TODO dataclasses?
+                ###TODO dataclasses for the head+venue+vehicle+event?
+                ###TODO measure speed for mmap vs mmap+memoryview
+
+                ### data's meta+data are more complicated, move to separate method?
+                ### each header seems to be 124bytes away. calculate instead of read?
+                self.channels = {}
                 channs_start = self.head.meta_ptr
-                channs_end = channs_start + ldChan.fmt_struct.size
-                self.channs = ldChan(mm[channs_start:channs_end])
-                ### TODO bring the rest of the sections here.
-                ### pass in only the areas of mm that are needed
-                ### probably keep track of offsets for sections
-                ### keep converting the fromfile to proper constructors
+                while channs_start > 0:
+                    channs_end = channs_start + ldChan.fmt_struct.size
+                    channel_mem_area = memoryview(mm[channs_start:channs_end])
+                    chan_ = ldChan(channel_mem_area).meta
+                    assert isinstance(chan_, dict)
+                    self.channels.update(chan_)
+                    ### FUGLY, wouldn't work other ways. FIXME
+                    channs_start = [v for v in chan_.values()][0].next_meta_ptr
+                ### TODO keep converting the fromfile to proper constructors
 
     def __getitem__(self, item):
         if not isinstance(item, int):
@@ -153,17 +169,14 @@ class ldEvent:
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, section_file_map):
-        name, session, comment, self.venue_ptr = ldEvent.fmt_struct.unpack(section_file_map)
+    def __init__(self, mem_area: memoryview) -> None:
+        name, session, comment, self.venue_ptr = ldEvent.fmt_struct.unpack(mem_area)
         self.name, self.session, self.comment = map(normalize_text, [name, session, comment])
 
     def write(self, f):
         raise NotImplementedError
-        f.write(struct.pack(ldEvent.fmt,
-                            self.name.encode(),
-                            self.session.encode(),
-                            self.comment.encode(),
-                            self.venue_ptr))
+        f.write(struct.pack(ldEvent.fmt, self.name.encode(), \
+                            self.session.encode(), self.comment.encode(), self.venue_ptr))
 
         if self.venue_ptr > 0:
             f.seek(self.venue_ptr)
@@ -178,9 +191,9 @@ class ldVenue:
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, section_file_map):
+    def __init__(self, mem_area: memoryview) -> None:
         """Parses and stores the venue information in ld file """
-        name, self.vehicle_ptr = ldVenue.fmt_struct.unpack(section_file_map)
+        name, self.vehicle_ptr = ldVenue.fmt_struct.unpack(mem_area)
         self.name = normalize_text(name)
 
     def write(self, f):
@@ -200,10 +213,10 @@ class ldVehicle:
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, section_file_map):
+    def __init__(self, mem_area: memoryview) -> None:
         """Parses and stores the vehicle information in an ld file """
         # self.id, self.weight, self.type, self.comment = id, weight, type, comment
-        vehicle_id, self.weight, vehicle_type, comment = ldVehicle.fmt_struct.unpack(section_file_map)
+        vehicle_id, self.weight, vehicle_type, comment = ldVehicle.fmt_struct.unpack(mem_area)
         self.id, self.type, self.comment = map(normalize_text, [vehicle_id, vehicle_type, comment])
 
     def write(self, f):
@@ -248,12 +261,12 @@ class ldHead:
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, section_file_map) -> None:
+    def __init__(self, mem_area: memoryview) -> None:
         """Parses and stores the header information of ld file """
         (_, meta_ptr, data_ptr, aux_ptr,
          _, _, _, _, _, _, _,
          n, date, time,
-         driver, vehicle_id, venue, _, short_comment, event, session) = ldHead.fmt_struct.unpack(section_file_map)
+         driver, vehicle_id, venue, _, short_comment, event, session) = ldHead.fmt_struct.unpack(mem_area)
 
         most_entries = (date, time, driver, vehicle_id, venue, short_comment, event, session)
         date, time, driver, vehicle_id, venue, short_comment, event, session = [normalize_text(entry) for entry in
@@ -310,41 +323,14 @@ class ldChan:
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, meta_ptr: int) -> None:
-        """ Read channel data inside ld file
-
-        Cycles through the channels inside ld file,
-         starting with the one where meta_ptr points to.
-         Returns a list of ldchan objects.
-        """
-        ### MAP OUT CHANNELS
+    def __init__(self, mem_area: memoryview) -> None:
+        ### MAP OUT CHANNELS, every 124 bytes
         self.meta = {}
-        unpacked_channel_meta = ldChan.fmt_struct.unpack(meta_ptr)  ### unpack into a tuple so we can pull out a name for indexing
+        ### unpack into a tuple, to extract a name for indexing
+        unpacked_channel_meta = ldChan.fmt_struct.unpack(mem_area)
         channel_name = normalize_text(unpacked_channel_meta[-3])
-        self.meta[channel_name] = ChanMeta(*unpacked_channel_meta) ### making a dataclass from the unpacked data
-
-        # prev_meta_ptr, next_meta_ptr, data_ptr, data_len, _, dtype_a, dtype, freq, shift, mul, scale, dec, name, short_name, unit = unpacked_fields
-        # name, short_name, unit = map(normalize_text, (name, short_name, unit))
-        # channel_values = \
-        #     (prev_meta_ptr, next_meta_ptr, data_ptr, data_len, _,
-        #      dtype_a, dtype, freq, shift, mul, scale, dec,
-        #      short_name, unit)
-
-        # self.channels[name] = channel_values
-        # self.channels[name] = locals()
-
-        ###experiment see if we can see second series
-        # unpacked_fields = ldChan.fmt_struct.unpack(self.next_meta_ptr)
-        # self.prev_meta_ptr, self.next_meta_ptr, self.data_ptr, self.data_len, _, self.dtype_a, self.dtype, self.freq, self.shift, self.mul, self.scale, self.dec, name, short_name, unit = unpacked_fields
-        # self.name, self.short_name, self.unit = map(normalize_text, (name, short_name, unit))
-
-        ### read in individual data series
-        # chans = []
-        # while meta_ptr:
-        #     chan_ = ldChan.fromfile(self.data_file, meta_ptr)
-        #     chans.append(chan_)
-        #     meta_ptr = chan_.next_meta_ptr
-        # return chans
+        ### making a dataclass from the unpacked data
+        self.meta[channel_name] = ChanMeta(*unpacked_channel_meta)
 
     def __str__(self):
         return f"Channels: {vars(self)}"
@@ -364,10 +350,11 @@ class ChanMeta:
     mul: int
     scale: int
     dec: int
-    name: str
-    short_name: str
-    unit: str
+    name: bytes
+    short_name: bytes
+    unit: bytes
 
+    ### bytes or str before or after the post_init?
     def __post_init__(self):
         self.name = normalize_text(self.name)
         self.short_name = normalize_text(self.short_name)
@@ -396,6 +383,10 @@ if __name__ == '__main__':
     from itertools import groupby
     import pandas as pd
     import matplotlib.pyplot as plt
+    from pprint import PrettyPrinter
+
+    pp = PrettyPrinter(indent=2, width=128)
+    ppp = pp.pprint
 
     if len(sys.argv) != 2:
         print("Usage: ldparser.py /some/path/somefile.ld")
@@ -414,7 +405,8 @@ if __name__ == '__main__':
         # print(f" [*] {l.channs.data_len}")
         # print(f" [*] {l.channs.name}")
         # print(f" [*] {l.channs.short_name}")
-        print(f" [*] {l.channs}")
+        print(f" [*] {len(l.channels)} Channels found")
+        ppp(vars(l))
         sys.exit(1)
 
         ###TODO make into a test case?  debug aid?
