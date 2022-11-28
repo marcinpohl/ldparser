@@ -12,6 +12,31 @@ import pandas as pd
 import numpy as np
 
 
+@dataclass(slots=True)
+class ChanMeta:
+    prev_meta_ptr: int
+    next_meta_ptr: int
+    data_ptr: int
+    data_len: int
+    blah: int
+    dtype_a: int
+    dtype: int
+    freq: int
+    shift: int
+    mul: int
+    scale: int
+    dec: int
+    name: bytes
+    short_name: bytes
+    unit: bytes
+
+    ### bytes or str before or after the post_init?
+    def __post_init__(self):
+        self.name = normalize_text(self.name)
+        self.short_name = normalize_text(self.short_name)
+        self.unit = normalize_text(self.unit)
+
+
 class ldData:
     """Container for parsed data of ld file. Allows reading and writing. """
 
@@ -52,32 +77,50 @@ class ldData:
                 ###TODO dataclasses for the head+venue+vehicle+event?
                 ###TODO measure speed for mmap vs mmap+memoryview
 
-                ### data's meta+data are more complicated, move to separate method?
-                ### each header seems to be 124bytes away. calculate instead of read?
-                self.channels = {}
-                channs_start = self.head.meta_ptr
-                while channs_start > 0:
-                    channs_end = channs_start + ldChan.fmt_struct.size
-                    channel_mem_area = memoryview(mm[channs_start:channs_end])
-                    chan_ = ldChan(channel_mem_area).meta
-                    assert isinstance(chan_, dict)
-                    self.channels.update(chan_)
-                    ### FUGLY, wouldn't work other ways. FIXME
-                    channs_start = [v for v in chan_.values()][0].next_meta_ptr
+                self.metadata_read(mm)
+
                 ### TODO keep converting the fromfile to proper constructors
 
+    @property
+    def channel_longnames(self) -> set:
+        return {channame for channame in self.channels.keys()}
+
+    @property
+    def channel_shortnames(self) -> set:
+        return {v.short_name for v in self.channels.values()}
+
+    def metadata_read(self, mm: mmap.mmap) -> None:
+        ### data's meta+data are more complicated, move to separate method?
+        ### each header seems to be 124bytes away. calculate instead of read?
+        self.channels = {}
+        channs_start = self.head.meta_ptr
+        while channs_start > 0:
+            channs_end = channs_start + ldChan.fmt_struct.size
+            channel_mem_area = memoryview(mm[channs_start:channs_end])
+            chan_ = ldChan(channel_mem_area).meta
+            assert isinstance(chan_, dict)
+            self.channels.update(chan_)
+            ### FUGLY, wouldn't work other ways. FIXME
+            channs_start = [v for v in chan_.values()][0].next_meta_ptr
+
+    def data_read(self, mm: mmap.mmap) -> None:
+        ### Materialized, just to play with to compare against lazy versions
+        ### TODO
+        pass
+
     def __getitem__(self, item):
-        if not isinstance(item, int):
-            col = [n for n, x in enumerate(self.channs) if x.name == item]
-            if len(col) != 1:
-                raise Exception("Could get column", item, col)
-            item = col[0]
-        return self.channs[item]
+        pass
+        # self._data = np.fromfile(f, count=self.data_len, dtype=self.dtype)
+        # self._data = (self._data / self.scale * pow(10., -self.dec) + self.shift) * self.mul
 
-    def __iter__(self):
-        return iter(x.name for x in self.channs)
+        # if not isinstance(item, int):
+        #     col = [n for n, x in enumerate(self.channs) if x.name == item]
+        #     if len(col) != 1:
+        #         raise Exception("Could get column", item, col)
+        #     item = col[0]
+        # return self.channs[item]
 
-    # noinspection PyArgumentList,PyUnusedLocal
+    # noinspection PyArgumentList,PyUnusedLocal,PyUnreachableCode
     @classmethod
     def frompd(cls, df: pd.DataFrame):
         raise NotImplementedError
@@ -151,6 +194,7 @@ class ldData:
             channs.append(chan)
         return cls(head, channs)
 
+    # noinspection PyUnreachableCode
     def write(self, f: str) -> None:  # noqa
         """Write ld file containing the current header information and channel data """
         raise NotImplementedError
@@ -173,9 +217,10 @@ class ldEvent:
         name, session, comment, self.venue_ptr = ldEvent.fmt_struct.unpack(mem_area)
         self.name, self.session, self.comment = map(normalize_text, [name, session, comment])
 
+    # noinspection PyUnreachableCode,PyUnusedLocal
     def write(self, f):
         raise NotImplementedError
-        f.write(struct.pack(ldEvent.fmt, self.name.encode(), \
+        f.write(struct.pack(ldEvent.fmt, self.name.encode(),
                             self.session.encode(), self.comment.encode(), self.venue_ptr))
 
         if self.venue_ptr > 0:
@@ -196,6 +241,7 @@ class ldVenue:
         name, self.vehicle_ptr = ldVenue.fmt_struct.unpack(mem_area)
         self.name = normalize_text(name)
 
+    # noinspection PyUnreachableCode,PyUnusedLocal
     def write(self, f):
         raise NotImplementedError
         f.write(struct.pack(ldVenue.fmt, self.name.encode(), self.vehicle_ptr))
@@ -219,6 +265,7 @@ class ldVehicle:
         vehicle_id, self.weight, vehicle_type, comment = ldVehicle.fmt_struct.unpack(mem_area)
         self.id, self.type, self.comment = map(normalize_text, [vehicle_id, vehicle_type, comment])
 
+    # noinspection PyUnreachableCode,PyUnusedLocal
     def write(self, f):
         raise NotImplementedError
         f.write(struct.pack(ldVehicle.fmt, self.id.encode(), self.weight, self.type.encode(), self.comment.encode()))
@@ -282,6 +329,7 @@ class ldHead:
         self.meta_ptr, self.data_ptr, self.aux_ptr, self.driver, self.vehicle_id, self.venue, self.datetime, self.short_comment, self.event, self.session = \
             meta_ptr, data_ptr, aux_ptr, driver, vehicle_id, venue, _datetime, short_comment, event, session
 
+    # noinspection PyUnreachableCode,PyUnusedLocal
     def write(self, f, n):
         raise NotImplementedError
         f.write(struct.pack(ldHead.fmt,
@@ -331,34 +379,17 @@ class ldChan:
         channel_name = normalize_text(unpacked_channel_meta[-3])
         ### making a dataclass from the unpacked data
         self.meta[channel_name] = ChanMeta(*unpacked_channel_meta)
+        # self.__setinit__(channel_name, ChanMeta(*unpacked_channel_meta))
+
+    # def __setinit__(self, channel_name: str, metadata: ChanMeta):
+    #     self.meta[channel_name] = metadata
+    #
+    # def __getinit__(self, channel_name: str):
+    #     return self.meta[channel_name]
 
     def __str__(self):
-        return f"Channels: {vars(self)}"
-
-
-@dataclass(slots=True)
-class ChanMeta:
-    prev_meta_ptr: int
-    next_meta_ptr: int
-    data_ptr: int
-    data_len: int
-    blah: int
-    dtype_a: int
-    dtype: int
-    freq: int
-    shift: int
-    mul: int
-    scale: int
-    dec: int
-    name: bytes
-    short_name: bytes
-    unit: bytes
-
-    ### bytes or str before or after the post_init?
-    def __post_init__(self):
-        self.name = normalize_text(self.name)
-        self.short_name = normalize_text(self.short_name)
-        self.unit = normalize_text(self.unit)
+        return f"Channels: {self.short_name}"
+        # return f"Channels: {vars(self)}"
 
 
 def normalize_text(inputs: bytes) -> str:
@@ -393,6 +424,7 @@ if __name__ == '__main__':
         sys.exit(1)
 
     data_files = Path.cwd().glob('*.ld')
+    # noinspection PyUnreachableCode
     for data_file in data_files:
         print(f" [*] Processing file: {data_file}")
         l = ldData(data_file)
@@ -406,7 +438,11 @@ if __name__ == '__main__':
         # print(f" [*] {l.channs.name}")
         # print(f" [*] {l.channs.short_name}")
         print(f" [*] {len(l.channels)} Channels found")
-        ppp(vars(l))
+        print('=' * 40)
+        ppp(l.channels['Brake'])
+        ppp(l.channel_shortnames)
+        ppp(l.channel_longnames)
+        # ppp(vars(l))
         sys.exit(1)
 
         ###TODO make into a test case?  debug aid?
