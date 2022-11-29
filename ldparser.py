@@ -41,67 +41,42 @@ class ldData:
     """Container for parsed data of ld file. Allows reading and writing. """
 
     def __init__(self, data_file: Path) -> None:
-        self.mem_areas = {}
         self.data_file = data_file
         with open(self.data_file, mode='rb') as fd:
             with mmap.mmap(fd.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                ###TODO extract all the pointer structures, make a 'index table' out of them
+                ### Create all the major sections by carving out the mmap'ed area
+                self.head = ldHead(mm)
+                self.aux = ldEvent(mm, self.head.aux_ptr)
+                self.venue = ldVenue(mm, self.aux.venue_ptr)
+                self.vehicle = ldVehicle(mm, self.venue.vehicle_ptr)
+                self.channels = self.metadata_read(mm)
 
-                ### ldHead
-                ### mem_areas MUST exist BEFORE/outside section-specific classes.
-                self.mem_areas['head'] = memoryview(mm[0:ldHead.fmt_struct.size])  ### it's a header, so start from 0
-                self.head = ldHead(self.mem_areas['head'])
-
-                ### ldEvent
-                if self.head.aux_ptr > 0:
-                    event_start = self.head.aux_ptr
-                    event_end = event_start + ldEvent.fmt_struct.size
-                    self.mem_areas['event'] = memoryview(mm[event_start:event_end])
-                    self.aux = ldEvent(self.mem_areas['event'])
-
-                ### ldVenue
-                if self.aux.venue_ptr > 0:
-                    venue_start = self.aux.venue_ptr
-                    venue_end = venue_start + ldVenue.fmt_struct.size
-                    self.mem_areas['venue'] = memoryview(mm[venue_start:venue_end])
-                    self.venue = ldVenue(self.mem_areas['venue'])
-
-                ### ldVehicle
-                if self.venue.vehicle_ptr > 0:
-                    vehicle_start = self.venue.vehicle_ptr
-                    vehicle_end = vehicle_start + ldVehicle.fmt_struct.size
-                    self.mem_areas['vehicle'] = memoryview(mm[vehicle_start:vehicle_end])
-                    self.vehicle = ldVehicle(self.mem_areas['vehicle'])
-
-                ### ldChan
-                ###TODO dataclasses for the head+venue+vehicle+event?
-                ###TODO measure speed for mmap vs mmap+memoryview
-
-                self.metadata_read(mm)
-
+                ### TODO dataclasses for the head+venue+vehicle+event?
+                ### TODO measure speed for mmap vs mmap+memoryview
                 ### TODO keep converting the fromfile to proper constructors
 
     @property
     def channel_longnames(self) -> set:
-        return {channame for channame in self.channels.keys()}
+        return self.channels.keys()
 
     @property
     def channel_shortnames(self) -> set:
         return {v.short_name for v in self.channels.values()}
 
-    def metadata_read(self, mm: mmap.mmap) -> None:
+    def metadata_read(self, mm: mmap.mmap) -> dict:
         ### data's meta+data are more complicated, move to separate method?
         ### each header seems to be 124bytes away. calculate instead of read?
-        self.channels = {}
+        channels = {}
         channs_start = self.head.meta_ptr
         while channs_start > 0:
             channs_end = channs_start + ldChan.fmt_struct.size
             channel_mem_area = memoryview(mm[channs_start:channs_end])
             chan_ = ldChan(channel_mem_area).meta
             assert isinstance(chan_, dict)
-            self.channels.update(chan_)
+            channels.update(chan_)
             ### FUGLY, wouldn't work other ways. FIXME
             channs_start = [v for v in chan_.values()][0].next_meta_ptr
+        return channels
 
     def data_read(self, mm: mmap.mmap) -> None:
         ### Materialized, just to play with to compare against lazy versions
@@ -171,11 +146,11 @@ class ldData:
 
         ### TODO separate function
         # create the channels, meta data and associated data
-        channs, prev, next = [], 0, meta_ptr + ldChan.fmt_struct.size
+        channs, prev, next_ptr = [], 0, meta_ptr + ldChan.fmt_struct.size
         for n, col in enumerate(cols):
             # create mocked channel header
             chan = ldChan(None,
-                          meta_ptr, prev, next if n < len(cols) - 1 else 0,
+                          meta_ptr, prev, next_ptr if n < len(cols) - 1 else 0,
                           data_ptr, len(df[col]),
                           dtype, freq, 0, 1, 1, 0,
                           col, col, "m")
@@ -185,8 +160,8 @@ class ldData:
 
             # calculate pointers to the previous/next channel meta data
             prev = meta_ptr
-            meta_ptr = next
-            next += ldChan.fmt_struct.size
+            meta_ptr = next_ptr
+            next_ptr += ldChan.fmt_struct.size
 
             # increment data pointer for next channel
             data_ptr += chan._data.nbytes
@@ -198,7 +173,7 @@ class ldData:
     def write(self, f: str) -> None:  # noqa
         """Write ld file containing the current header information and channel data """
         raise NotImplementedError
-        # convert the data using scale/shift etc before writing the data
+        # convert the data using scale/shift etc. before writing the data
         conv_data = lambda c: ((c.data / c.mul) - c.shift) * c.scale / pow(10., -c.dec)
 
         with open(f, 'wb') as f_:
@@ -213,9 +188,12 @@ class ldEvent:
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, mem_area: memoryview) -> None:
-        name, session, comment, self.venue_ptr = ldEvent.fmt_struct.unpack(mem_area)
-        self.name, self.session, self.comment = map(normalize_text, [name, session, comment])
+    def __init__(self, mm: mmap.mmap, event_start: int) -> None:
+        if event_start > 0:
+            event_end = event_start + ldEvent.fmt_struct.size
+            mem_area = memoryview(mm[event_start:event_end])
+            name, session, comment, self.venue_ptr = ldEvent.fmt_struct.unpack(mem_area)
+            self.name, self.session, self.comment = map(normalize_text, [name, session, comment])
 
     # noinspection PyUnreachableCode,PyUnusedLocal
     def write(self, f):
@@ -236,10 +214,13 @@ class ldVenue:
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, mem_area: memoryview) -> None:
+    def __init__(self, mm: mmap.mmap, venue_start: int) -> None:
         """Parses and stores the venue information in ld file """
-        name, self.vehicle_ptr = ldVenue.fmt_struct.unpack(mem_area)
-        self.name = normalize_text(name)
+        if venue_start > 0:
+            venue_end = venue_start + ldVenue.fmt_struct.size
+            mem_area = memoryview(mm[venue_start:venue_end])
+            name, self.vehicle_ptr = ldVenue.fmt_struct.unpack(mem_area)
+            self.name = normalize_text(name)
 
     # noinspection PyUnreachableCode,PyUnusedLocal
     def write(self, f):
@@ -259,11 +240,14 @@ class ldVehicle:
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, mem_area: memoryview) -> None:
-        """Parses and stores the vehicle information in an ld file """
+    def __init__(self, mm: mmap.mmap, vehicle_start: int) -> None:
+        """Parses and stores the vehicle information in LD file """
         # self.id, self.weight, self.type, self.comment = id, weight, type, comment
-        vehicle_id, self.weight, vehicle_type, comment = ldVehicle.fmt_struct.unpack(mem_area)
-        self.id, self.type, self.comment = map(normalize_text, [vehicle_id, vehicle_type, comment])
+        if vehicle_start > 0:
+            vehicle_end = vehicle_start + ldVehicle.fmt_struct.size
+            mem_area = memoryview(mm[vehicle_start:vehicle_end])
+            vehicle_id, self.weight, vehicle_type, comment = ldVehicle.fmt_struct.unpack(mem_area)
+            self.id, self.type, self.comment = map(normalize_text, [vehicle_id, vehicle_type, comment])
 
     # noinspection PyUnreachableCode,PyUnusedLocal
     def write(self, f):
@@ -308,12 +292,14 @@ class ldHead:
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, mem_area: memoryview) -> None:
+    def __init__(self, mm: mmap.mmap) -> None:
         """Parses and stores the header information of ld file """
-        (_, meta_ptr, data_ptr, aux_ptr,
-         _, _, _, _, _, _, _,
-         n, date, time,
-         driver, vehicle_id, venue, _, short_comment, event, session) = ldHead.fmt_struct.unpack(mem_area)
+        mem_area = memoryview(mm[0:ldHead.fmt_struct.size])  ### it's a header, so start from 0
+        _, \
+        meta_ptr, data_ptr, aux_ptr, \
+        _, _, _, _, _, _, _, \
+        n, date, time, driver, vehicle_id, venue, _, \
+        short_comment, event, session = ldHead.fmt_struct.unpack(mem_area)
 
         most_entries = (date, time, driver, vehicle_id, venue, short_comment, event, session)
         date, time, driver, vehicle_id, venue, short_comment, event, session = [normalize_text(entry) for entry in
@@ -379,17 +365,9 @@ class ldChan:
         channel_name = normalize_text(unpacked_channel_meta[-3])
         ### making a dataclass from the unpacked data
         self.meta[channel_name] = ChanMeta(*unpacked_channel_meta)
-        # self.__setinit__(channel_name, ChanMeta(*unpacked_channel_meta))
-
-    # def __setinit__(self, channel_name: str, metadata: ChanMeta):
-    #     self.meta[channel_name] = metadata
-    #
-    # def __getinit__(self, channel_name: str):
-    #     return self.meta[channel_name]
 
     def __str__(self):
-        return f"Channels: {self.short_name}"
-        # return f"Channels: {vars(self)}"
+        return f"Channels: {vars(self)}"
 
 
 def normalize_text(inputs: bytes) -> str:
@@ -411,9 +389,9 @@ if __name__ == '__main__':
     """
 
     import sys
-    from itertools import groupby
+    # from itertools import groupby
     import pandas as pd
-    import matplotlib.pyplot as plt
+    # import matplotlib.pyplot as plt
     from pprint import PrettyPrinter
 
     pp = PrettyPrinter(indent=2, width=128)
@@ -433,15 +411,12 @@ if __name__ == '__main__':
         print(f" [*] {l.aux}")
         print(f" [*] {l.vehicle}")
         print(f" [*] {l.venue}")
-        # print(f" [*] {l.channs.data_ptr}")
-        # print(f" [*] {l.channs.data_len}")
-        # print(f" [*] {l.channs.name}")
-        # print(f" [*] {l.channs.short_name}")
         print(f" [*] {len(l.channels)} Channels found")
+        # print('=' * 40)
+        # ppp(l.channels)
         print('=' * 40)
         ppp(l.channels['Brake'])
-        ppp(l.channel_shortnames)
-        ppp(l.channel_longnames)
+        # ppp(l.channel_longnames)
         # ppp(vars(l))
         sys.exit(1)
 
