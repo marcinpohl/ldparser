@@ -2,6 +2,7 @@
 
 Code created through reverse engineering the data format.
 """
+import typing
 from dataclasses import dataclass
 import datetime
 import struct
@@ -10,6 +11,7 @@ from pathlib import Path
 import pandas as pd
 
 import numpy as np
+from pympler.asizeof import asizeof
 
 
 @dataclass(slots=True)
@@ -42,21 +44,19 @@ class ldData:
 
     def __init__(self, data_file: Path) -> None:
         self.data_file = data_file
+        self.channels = {}
         with open(self.data_file, mode='rb') as fd:
             with mmap.mmap(fd.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                ### Create all the major sections by carving out the mmap'ed area
+                ### Create all the major sections
                 self.head = ldHead(mm)
                 self.aux = ldEvent(mm, self.head.aux_ptr)
                 self.venue = ldVenue(mm, self.aux.venue_ptr)
                 self.vehicle = ldVehicle(mm, self.venue.vehicle_ptr)
                 self.channels = self.metadata_read(mm)
-
                 ### TODO dataclasses for the head+venue+vehicle+event?
-                ### TODO measure speed for mmap vs mmap+memoryview
-                ### TODO keep converting the fromfile to proper constructors
 
     @property
-    def channel_longnames(self) -> set:
+    def channel_longnames(self) -> typing.KeysView:
         return self.channels.keys()
 
     @property
@@ -66,16 +66,17 @@ class ldData:
     def metadata_read(self, mm: mmap.mmap) -> dict:
         ### data's meta+data are more complicated, move to separate method?
         ### each header seems to be 124bytes away. calculate instead of read?
+
+        ### This feels like it needs to be dict comprehension FIXME
         channels = {}
         channs_start = self.head.meta_ptr
         while channs_start > 0:
-            channs_end = channs_start + ldChan.fmt_struct.size
-            channel_mem_area = memoryview(mm[channs_start:channs_end])
-            chan_ = ldChan(channel_mem_area).meta
-            assert isinstance(chan_, dict)
+            chan_ = ldChan(mm, channs_start).meta
+            assert isinstance(chan_, dict), 'chan_ needs to be a dict to update channels'
             channels.update(chan_)
             ### FUGLY, wouldn't work other ways. FIXME
             channs_start = [v for v in chan_.values()][0].next_meta_ptr
+            del chan_
         return channels
 
     def data_read(self, mm: mmap.mmap) -> None:
@@ -95,7 +96,7 @@ class ldData:
         #     item = col[0]
         # return self.channs[item]
 
-    # noinspection PyArgumentList,PyUnusedLocal,PyUnreachableCode
+    # noinspection PyArgumentList,PyUnusedLocal,PyUnreachableCode,PyShadowingNames
     @classmethod
     def frompd(cls, df: pd.DataFrame):
         raise NotImplementedError
@@ -190,12 +191,10 @@ class ldEvent:
 
     def __init__(self, mm: mmap.mmap, event_start: int) -> None:
         if event_start > 0:
-            event_end = event_start + ldEvent.fmt_struct.size
-            mem_area = memoryview(mm[event_start:event_end])
-            name, session, comment, self.venue_ptr = ldEvent.fmt_struct.unpack(mem_area)
+            name, session, comment, self.venue_ptr = ldEvent.fmt_struct.unpack_from(mm, offset=event_start)
             self.name, self.session, self.comment = map(normalize_text, [name, session, comment])
 
-    # noinspection PyUnreachableCode,PyUnusedLocal
+    # noinspection PyUnreachableCode,PyUnusedLocal,PyShadowingNames
     def write(self, f):
         raise NotImplementedError
         f.write(struct.pack(ldEvent.fmt, self.name.encode(),
@@ -217,12 +216,10 @@ class ldVenue:
     def __init__(self, mm: mmap.mmap, venue_start: int) -> None:
         """Parses and stores the venue information in ld file """
         if venue_start > 0:
-            venue_end = venue_start + ldVenue.fmt_struct.size
-            mem_area = memoryview(mm[venue_start:venue_end])
-            name, self.vehicle_ptr = ldVenue.fmt_struct.unpack(mem_area)
+            name, self.vehicle_ptr = ldVenue.fmt_struct.unpack_from(mm, venue_start)
             self.name = normalize_text(name)
 
-    # noinspection PyUnreachableCode,PyUnusedLocal
+    # noinspection PyUnreachableCode,PyUnusedLocal,PyShadowingNames
     def write(self, f):
         raise NotImplementedError
         f.write(struct.pack(ldVenue.fmt, self.name.encode(), self.vehicle_ptr))
@@ -242,14 +239,11 @@ class ldVehicle:
 
     def __init__(self, mm: mmap.mmap, vehicle_start: int) -> None:
         """Parses and stores the vehicle information in LD file """
-        # self.id, self.weight, self.type, self.comment = id, weight, type, comment
         if vehicle_start > 0:
-            vehicle_end = vehicle_start + ldVehicle.fmt_struct.size
-            mem_area = memoryview(mm[vehicle_start:vehicle_end])
-            vehicle_id, self.weight, vehicle_type, comment = ldVehicle.fmt_struct.unpack(mem_area)
+            vehicle_id, self.weight, vehicle_type, comment = ldVehicle.fmt_struct.unpack_from(mm, offset=vehicle_start)
             self.id, self.type, self.comment = map(normalize_text, [vehicle_id, vehicle_type, comment])
 
-    # noinspection PyUnreachableCode,PyUnusedLocal
+    # noinspection PyUnreachableCode,PyUnusedLocal,PyShadowingNames
     def write(self, f):
         raise NotImplementedError
         f.write(struct.pack(ldVehicle.fmt, self.id.encode(), self.weight, self.type.encode(), self.comment.encode()))
@@ -294,12 +288,10 @@ class ldHead:
 
     def __init__(self, mm: mmap.mmap) -> None:
         """Parses and stores the header information of ld file """
-        mem_area = memoryview(mm[0:ldHead.fmt_struct.size])  ### it's a header, so start from 0
-        _, \
-        meta_ptr, data_ptr, aux_ptr, \
-        _, _, _, _, _, _, _, \
-        n, date, time, driver, vehicle_id, venue, _, \
-        short_comment, event, session = ldHead.fmt_struct.unpack(mem_area)
+        _, meta_ptr, data_ptr, aux_ptr, \
+            _, _, _, _, _, _, _, \
+            n, date, time, driver, vehicle_id, venue, _, \
+            short_comment, event, session = ldHead.fmt_struct.unpack_from(mm, offset=0)
 
         most_entries = (date, time, driver, vehicle_id, venue, short_comment, event, session)
         date, time, driver, vehicle_id, venue, short_comment, event, session = [normalize_text(entry) for entry in
@@ -315,7 +307,7 @@ class ldHead:
         self.meta_ptr, self.data_ptr, self.aux_ptr, self.driver, self.vehicle_id, self.venue, self.datetime, self.short_comment, self.event, self.session = \
             meta_ptr, data_ptr, aux_ptr, driver, vehicle_id, venue, _datetime, short_comment, event, session
 
-    # noinspection PyUnreachableCode,PyUnusedLocal
+    # noinspection PyUnreachableCode,PyUnusedLocal,PyShadowingNames
     def write(self, f, n):
         raise NotImplementedError
         f.write(struct.pack(ldHead.fmt,
@@ -340,7 +332,6 @@ class ldChan:
     """Channel (meta) data
 
     Parses and stores the channel metadata in a ld file.
-    Needs the pointer to the channel meta block in the ld file.
     The actual data is read on demand using the 'data' property.
     """
 
@@ -357,11 +348,11 @@ class ldChan:
     fmt_struct = struct.Struct(fmt)
     del fmt
 
-    def __init__(self, mem_area: memoryview) -> None:
+    def __init__(self, mem_area: mmap.mmap, chan_start: int) -> None:
         ### MAP OUT CHANNELS, every 124 bytes
         self.meta = {}
         ### unpack into a tuple, to extract a name for indexing
-        unpacked_channel_meta = ldChan.fmt_struct.unpack(mem_area)
+        unpacked_channel_meta = ldChan.fmt_struct.unpack_from(mem_area, offset=chan_start)
         channel_name = normalize_text(unpacked_channel_meta[-3])
         ### making a dataclass from the unpacked data
         self.meta[channel_name] = ChanMeta(*unpacked_channel_meta)
@@ -381,6 +372,7 @@ def normalize_text(inputs: bytes) -> str:
         # raise e
 
 
+# noinspection PyUnreachableCode
 if __name__ == '__main__':
     """ Small test of the parser.
     
@@ -390,7 +382,7 @@ if __name__ == '__main__':
 
     import sys
     # from itertools import groupby
-    import pandas as pd
+    # import pandas as pd
     # import matplotlib.pyplot as plt
     from pprint import PrettyPrinter
 
@@ -402,10 +394,10 @@ if __name__ == '__main__':
         sys.exit(1)
 
     data_files = Path.cwd().glob('*.ld')
-    # noinspection PyUnreachableCode
     for data_file in data_files:
         print(f" [*] Processing file: {data_file}")
         l = ldData(data_file)
+
         ###checking __str__
         print(f" [*] {l.head}")
         print(f" [*] {l.aux}")
@@ -418,11 +410,13 @@ if __name__ == '__main__':
         ppp(l.channels['Brake'])
         # ppp(l.channel_longnames)
         # ppp(vars(l))
-        sys.exit(1)
+        ppp(asizeof(l))
+    # ppp(type(l))
+    sys.exit(1)
 
-        ###TODO make into a test case?  debug aid?
-        # create plots for all channels with the same frequency
-        for f, g in groupby(l.channs, lambda x: x.freq):
-            df = pd.DataFrame({i.name.lower(): i.data for i in g})
-            df.plot()
-            plt.show()
+    ###TODO make into a test case?  debug aid?
+    # create plots for all channels with the same frequency
+    for f, g in groupby(l.channs, lambda x: x.freq):
+        df = pd.DataFrame({i.name.lower(): i.data for i in g})
+        df.plot()
+        plt.show()
